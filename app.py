@@ -1,0 +1,324 @@
+"""
+Settlement PDF Splitter — Vercel (Flask preset).
+
+Root `app` WSGI entrypoint, auto-detected by Vercel's Flask preset.
+HTML is inlined (no templates/ folder) because Vercel's Python builder does not
+reliably bundle template files into the function. MinIO failures are non-fatal:
+the page still loads and falls back to a local download token.
+"""
+import os
+import sys
+import uuid
+import logging
+import traceback
+from datetime import datetime
+
+from flask import Flask, request, jsonify, send_file, Response
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+
+from splitter import split_pdf_file
+import storage
+
+app = Flask(__name__, static_folder=None)
+app.secret_key = "kashier-secret-key"
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024  # 4 MB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+    force=True,
+)
+logger = logging.getLogger("kashier_splitter")
+
+
+def log(msg, *args):
+    logger.info(msg, *args)
+    sys.stdout.flush()
+
+
+def storage_enabled_safe():
+    """Never let a storage/network error crash a request."""
+    try:
+        return storage.is_enabled()
+    except Exception as e:
+        log("storage check failed (treating as disabled): %s", e)
+        return False
+
+
+TMP_ROOT = "/tmp/kashier"
+UPLOAD_FOLDER = os.path.join(TMP_ROOT, "uploads")
+OUTPUT_FOLDER = os.path.join(TMP_ROOT, "outputs")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kashier Settlement Split ACH</title>
+    <style>
+        :root { --blue:#00509E; --blue-dark:#003B73; --ink:#1b2733; --muted:#5b6b7b; }
+        * { box-sizing: border-box; }
+        body {
+            margin:0; min-height:100vh; font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+            background:radial-gradient(1200px 600px at 50% -10%, #e8f1fb 0%, #f6f9fc 55%, #eef3f8 100%);
+            display:flex; align-items:center; justify-content:center; padding:24px; color:var(--ink);
+        }
+        .card {
+            width:100%; max-width:480px; background:#fff; border-radius:20px;
+            box-shadow:0 18px 50px rgba(0,59,115,.12); padding:40px 36px; text-align:center;
+            border:1px solid #eef2f6;
+        }
+        .logo { height:46px; margin-bottom:18px; }
+        h1 { font-size:26px; letter-spacing:1px; margin:0 0 4px; font-weight:800; }
+        h1 span { color:var(--blue); }
+        .rule { height:3px; width:54px; background:var(--blue); border-radius:3px; margin:14px auto 16px; }
+        .subtitle { color:var(--muted); font-size:14px; margin:0 0 26px; }
+        .drop {
+            border:2px dashed #cdddec; border-radius:14px; padding:26px 16px; cursor:pointer;
+            transition:.15s; background:#fafcff;
+        }
+        .drop:hover, .drop.drag { border-color:var(--blue); background:#f1f7ff; }
+        .drop .hint { color:var(--muted); font-size:13px; margin-top:6px; }
+        .drop .fname { color:var(--blue-dark); font-weight:600; word-break:break-all; }
+        input[type=file] { display:none; }
+        button {
+            margin-top:22px; width:100%; border:0; border-radius:12px; padding:14px;
+            background:var(--blue); color:#fff; font-size:15px; font-weight:700; cursor:pointer;
+            transition:.15s;
+        }
+        button:hover { background:var(--blue-dark); }
+        button:disabled { opacity:.55; cursor:not-allowed; }
+        .panel { margin-top:22px; display:none; }
+        .panel.show { display:block; }
+        .spinner {
+            width:34px; height:34px; border:4px solid #dce8f4; border-top-color:var(--blue);
+            border-radius:50%; animation:spin .8s linear infinite; margin:0 auto 12px;
+        }
+        @keyframes spin { to { transform:rotate(360deg); } }
+        .muted { color:var(--muted); font-size:13px; }
+        .ok-badge {
+            width:46px; height:46px; border-radius:50%; background:#e7f6ec; color:#1f9d55;
+            display:flex; align-items:center; justify-content:center; font-size:26px; margin:0 auto 12px;
+        }
+        .dl-btn {
+            display:inline-block; margin-top:14px; text-decoration:none; background:var(--blue);
+            color:#fff; padding:12px 22px; border-radius:12px; font-weight:700; font-size:14px;
+        }
+        .dl-btn:hover { background:var(--blue-dark); }
+        .err {
+            margin-top:18px; background:#fdecec; color:#b3261e; border:1px solid #f6c5c0;
+            border-radius:10px; padding:12px 14px; font-size:13px; display:none;
+        }
+        .err.show { display:block; }
+        .footer { margin-top:22px; font-size:11px; color:#9fb0c0; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <img class="logo" src="/logo.png" alt="Kashier" onerror="this.style.display='none'">
+        <h1>SETTLEMENT SPLIT <span>ACH</span></h1>
+        <div class="rule"></div>
+        <p class="subtitle">Upload a settlement PDF and split automatically by MID</p>
+
+        <label class="drop" id="drop">
+            <div id="dropText">📄 Click or drop a PDF here</div>
+            <div class="hint" id="dropHint">Max 4 MB on this platform</div>
+            <input type="file" id="file" accept="application/pdf">
+        </label>
+
+        <button id="go" disabled>Split PDF</button>
+
+        <div class="panel" id="working">
+            <div class="spinner"></div>
+            <div class="muted">Splitting and packaging… this can take a moment.</div>
+        </div>
+
+        <div class="panel" id="done">
+            <div class="ok-badge">✓</div>
+            <div><strong>Done!</strong></div>
+            <div class="muted" id="doneInfo"></div>
+            <a class="dl-btn" id="dl" href="#">Download ZIP</a>
+        </div>
+
+        <div class="err" id="err"></div>
+
+        <div class="footer">Confidential — Kashier Payment Solutions</div>
+    </div>
+
+<script>
+    const fileInput = document.getElementById('file');
+    const drop      = document.getElementById('drop');
+    const dropText  = document.getElementById('dropText');
+    const go         = document.getElementById('go');
+    const working    = document.getElementById('working');
+    const done       = document.getElementById('done');
+    const doneInfo   = document.getElementById('doneInfo');
+    const dl         = document.getElementById('dl');
+    const err        = document.getElementById('err');
+
+    const MAX = 4 * 1024 * 1024;
+
+    function reset() {
+        working.classList.remove('show');
+        done.classList.remove('show');
+        err.classList.remove('show');
+    }
+    function showErr(msg) { reset(); err.textContent = msg; err.classList.add('show'); }
+
+    fileInput.addEventListener('change', () => {
+        const f = fileInput.files[0];
+        reset();
+        if (!f) { go.disabled = true; dropText.textContent = '📄 Click or drop a PDF here'; return; }
+        if (f.size > MAX) { showErr('That PDF is ' + (f.size/1024/1024).toFixed(1) + ' MB — over the 4 MB platform limit.'); go.disabled = true; return; }
+        dropText.innerHTML = '<span class="fname">' + f.name + '</span>';
+        go.disabled = false;
+    });
+
+    // drag & drop
+    ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+    ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+    drop.addEventListener('drop', e => {
+        if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; fileInput.dispatchEvent(new Event('change')); }
+    });
+
+    go.addEventListener('click', async () => {
+        const f = fileInput.files[0];
+        if (!f) return;
+        reset();
+        go.disabled = true;
+        working.classList.add('show');
+
+        const fd = new FormData();
+        fd.append('pdf_file', f);
+
+        try {
+            const res  = await fetch('/upload', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!res.ok || !data.ok) { showErr(data.error || ('Upload failed (HTTP ' + res.status + ')')); go.disabled = false; return; }
+
+            working.classList.remove('show');
+            doneInfo.textContent = data.count + ' file(s) produced — ' + data.filename;
+            dl.href = data.download_url;
+            done.classList.add('show');
+            // auto-start the download from MinIO (presigned URL)
+            window.location.href = data.download_url;
+        } catch (e) {
+            showErr('Network error: ' + e.message);
+            go.disabled = false;
+        }
+    });
+</script>
+</body>
+</html>
+"""
+
+
+@app.errorhandler(413)
+def too_large(e):
+    log("!!! 413 REQUEST ENTITY TOO LARGE — Content-Length=%s", request.content_length)
+    return jsonify({
+        "ok": False,
+        "error": "PDF is larger than the 4 MB upload limit on this platform. "
+                 "Split it into smaller files, or deploy on a host without the cap."
+    }), 413
+
+
+@app.route("/", methods=["GET"])
+def home():
+    return Response(INDEX_HTML, mimetype="text/html")
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "ok": True,
+        "storage": "minio" if storage_enabled_safe() else "local-fallback",
+        "writable_tmp": os.access(TMP_ROOT, os.W_OK),
+    })
+
+
+@app.route("/upload", methods=["POST"])
+def upload_pdf():
+    log("=== /upload reached ===")
+
+    if "pdf_file" not in request.files:
+        return jsonify({"ok": False, "error": "No file uploaded"}), 400
+
+    file = request.files["pdf_file"]
+    if not file.filename:
+        return jsonify({"ok": False, "error": "Please select a PDF file"}), 400
+    if not file.filename.lower().endswith(".pdf"):
+        return jsonify({"ok": False, "error": "Only PDF files are allowed"}), 400
+
+    unique_id = str(uuid.uuid4())
+    upload_path = os.path.join(UPLOAD_FOLDER, unique_id + ".pdf")
+    output_path = os.path.join(OUTPUT_FOLDER, unique_id)
+    os.makedirs(output_path, exist_ok=True)
+
+    try:
+        file.save(upload_path)
+        saved_bytes = os.path.getsize(upload_path)
+        log("Saved upload: %s (%.2f MB)", file.filename, saved_bytes / 1024 / 1024)
+
+        log("Splitting...")
+        zip_path = split_pdf_file(upload_path, output_path)
+        if not zip_path or not os.path.exists(zip_path):
+            return jsonify({"ok": False, "error": "Split finished but ZIP was not created."}), 500
+
+        zip_size = os.path.getsize(zip_path)
+        produced = sum(
+            1 for root, _, files in os.walk(output_path)
+            for f in files if f.lower().endswith(".pdf")
+        )
+        log("Split OK: %d PDFs, zip=%.2f MB", produced, zip_size / 1024 / 1024)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.splitext(os.path.basename(file.filename))[0]
+        saved_name = ts + "_" + base + ".zip"
+
+        if storage_enabled_safe():
+            try:
+                obj = storage.upload_file(zip_path, saved_name, content_type="application/zip")
+                url = storage.presigned_url(obj) if obj else None
+                if url:
+                    log("MinIO URL ready")
+                    return jsonify({"ok": True, "count": produced,
+                                    "filename": saved_name, "download_url": url, "via": "minio"})
+                log("MinIO upload/presign failed; using local fallback")
+            except Exception as e:
+                log("MinIO error; using local fallback: %s", e)
+
+        # Local fallback (works within this invocation; ephemeral on Vercel).
+        with open(os.path.join(TMP_ROOT, unique_id + ".zippath"), "w") as f:
+            f.write(zip_path)
+        return jsonify({"ok": True, "count": produced, "filename": saved_name,
+                        "download_url": "/download/" + unique_id, "via": "local"})
+
+    except Exception as e:
+        log("UPLOAD FAILED: %s\n%s", e, traceback.format_exc())
+        return jsonify({"ok": False, "error": "Processing failed: " + str(e)}), 500
+
+
+@app.route("/download/<token>", methods=["GET"])
+def download_local(token):
+    safe = os.path.basename(token)
+    ptr = os.path.join(TMP_ROOT, safe + ".zippath")
+    if not os.path.exists(ptr):
+        return jsonify({"error": "not found or expired"}), 404
+    with open(ptr) as f:
+        zip_path = f.read().strip()
+    if not os.path.exists(zip_path):
+        return jsonify({"error": "expired"}), 404
+    return send_file(zip_path, as_attachment=True,
+                     download_name="Kashier_Settlement_Output.zip",
+                     mimetype="application/zip")
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)
